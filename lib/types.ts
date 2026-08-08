@@ -44,7 +44,11 @@ export type ScriptStreamPayload = {
   streamId: string;
   title: string;
   content: string;
-  mode: "write" | "edit";
+  // "write" creates a new node. "edit" replaces ONE paragraph of an existing
+  // one. "rewrite" replaces ALL paragraphs of an existing one, in place —
+  // needed because an edit cannot delete, insert, or renumber paragraphs, so
+  // "remove Java from the top 5" is not expressible as an edit.
+  mode: "write" | "edit" | "rewrite";
   blockIndex?: number; // edit mode: which paragraph is being replaced
   done: boolean;
 };
@@ -55,7 +59,7 @@ export type ScriptStreamPayload = {
 // on ScriptStreamPayload above.
 export type ScriptChipPayload = {
   title: string;
-  mode: "write" | "edit";
+  mode: "write" | "edit" | "rewrite";
   done: boolean;
 };
 

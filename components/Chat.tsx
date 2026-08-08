@@ -79,7 +79,13 @@ const ChatLog = memo(function ChatLog({
               if (part.type === "data-scriptChip")
                 return (
                   <div key={i} className="chip">
-                    📝 {part.data.mode === "edit" ? "Revising" : "Writing"} →{" "}
+                    📝{" "}
+                    {part.data.mode === "write"
+                      ? "Writing"
+                      : part.data.mode === "rewrite"
+                        ? "Rewriting"
+                        : "Revising"}{" "}
+                    →{" "}
                     “{part.data.title || "script"}”
                     {part.data.done ? " ✓" : " …"}
                   </div>

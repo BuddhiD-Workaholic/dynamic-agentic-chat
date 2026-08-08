@@ -71,6 +71,25 @@ export const buildTools = (scripts: BoardScript[]) => ({
     }),
   }),
 
+  // The action that was missing, and the reason a "remove Java from the top 5"
+  // request used to land on writeScript: editBlock swaps one paragraph for one
+  // paragraph, so it cannot delete an item, insert one, or renumber the ones
+  // around it. Faced with a request needing any of that, the only tool whose
+  // EFFECT matched was writeScript — which spawns a second node. This one
+  // restructures in place, keeping the same nodeId.
+  rewriteScript: tool({
+    description:
+      'Replace an EXISTING script with a fully revised version, IN PLACE, keeping the same node. Use whenever the change cannot be contained inside a single paragraph: removing an item from a list, adding one, reordering, changing the count ("make it a top 3"), or any edit that would leave the numbering, intro, or outro inconsistent. Examples: "remove Java from the top 5", "add Swift as well", "cut the last tip". This creates NO new node — never use writeScript to iterate on a script the user already has. Only for requests that change the script itself: a question ABOUT a script ("summarise it", "what does it say") is answerInChat. Get nodeId from listEditors first.',
+    inputSchema: z.object({
+      nodeId: z.string().describe("Id of the existing script node to replace."),
+      instruction: z
+        .string()
+        .describe(
+          'The whole change to make, e.g. "remove Java and renumber the remaining four".',
+        ),
+    }),
+  }),
+
   createMindmap: tool({
     description:
       "Create a mindmap (NOT a script). Use for mindmap/diagram requests. Stub in this POC — it exists to prove a non-script intent routes somewhere else instead of tripping the script path.",
@@ -100,12 +119,21 @@ export const fallbackRouteTool = tool({
   description: "Classify what the user is asking for.",
   inputSchema: z.object({
     action: z
-      .enum(["writeScript", "editBlock", "createMindmap", "answerInChat"])
+      .enum([
+        "writeScript",
+        "editBlock",
+        "rewriteScript",
+        "createMindmap",
+        "answerInChat",
+      ])
       .describe(
-        "writeScript = new long-form content for the canvas. editBlock = change part of an existing script. createMindmap = mindmap/diagram. answerInChat = anything else.",
+        "writeScript = a NEW, separate piece of long-form content. editBlock = change one paragraph of an existing script, leaving the rest valid. rewriteScript = restructure an existing script in place (add/remove/reorder an item, or anything that makes the numbering or intro inconsistent). createMindmap = mindmap/diagram. answerInChat = anything else.",
       ),
     title: z.string().optional().describe("writeScript: short node label."),
-    nodeId: z.string().optional().describe("editBlock: target script node id."),
+    nodeId: z
+      .string()
+      .optional()
+      .describe("editBlock / rewriteScript: target script node id."),
     blockIndex: z
       .number()
       .int()
@@ -114,7 +142,9 @@ export const fallbackRouteTool = tool({
     instruction: z
       .string()
       .optional()
-      .describe("editBlock: what to change about that paragraph."),
+      .describe(
+        "editBlock: what to change about that paragraph. rewriteScript: the whole change to make.",
+      ),
     topic: z.string().optional().describe("createMindmap: the topic."),
   }),
 });

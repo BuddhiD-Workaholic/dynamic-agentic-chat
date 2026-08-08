@@ -17,7 +17,7 @@ type Buffer = {
   streamId: string;
   title: string;
   content: string;
-  mode: "write" | "edit";
+  mode: "write" | "edit" | "rewrite";
   blockIndex?: number;
   streaming: boolean;
 };
@@ -60,10 +60,12 @@ function commit(nodes: Node[], nodeId: string, buf: Buffer): Node[] {
     if (n.id !== nodeId) return n;
     const d = n.data as ScriptNodeData;
     const text = buf.content.trim();
+    // Only "edit" is surgical. "write" and "rewrite" both deliver a whole
+    // script; they differ solely in whether the node already existed.
     const blocks =
-      buf.mode === "write"
-        ? toBlocks(buf.content)
-        : d.blocks.map((b, i) => (i === buf.blockIndex ? text : b));
+      buf.mode === "edit"
+        ? d.blocks.map((b, i) => (i === buf.blockIndex ? text : b))
+        : toBlocks(buf.content);
     return {
       ...n,
       data: {
@@ -106,6 +108,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       let edges = s.edges;
 
       // First sight of a new script: add the node and wire it back to the chat.
+      // Guarded on "write" specifically — a rewrite targets a node that already
+      // exists, so it must never spawn a second one. That is the whole point.
       if (p.mode === "write" && !nodes.some((n) => n.id === p.nodeId)) {
         const count = nodes.filter(
           (n) => (n.data as { kind?: string }).kind === "script",

@@ -14,10 +14,11 @@ import { model, routerModel } from "@/lib/ai/model";
 import { buildTools, fallbackRouteTool } from "@/lib/ai/tools";
 import {
   AGENT_SYSTEM,
-  CHAT_SYSTEM,
   WRITE_SYSTEM,
   boardIndex,
+  chatSystem,
   editSystem,
+  rewriteSystem,
 } from "@/lib/ai/prompt";
 import type {
   AppUIMessage,
@@ -48,7 +49,30 @@ export async function POST(req: Request) {
     scripts?: BoardScript[];
   };
 
-  const modelMessages: ModelMessage[] = convertToModelMessages(messages);
+  // convertDataPart is what keeps the assistant's past turns from being EMPTY.
+  //
+  // Script bodies are transient by design, so the only thing an assistant turn
+  // carries is the chip — and data parts are dropped unless this is supplied.
+  // Without it the router reads a history of blank assistant replies, which
+  // looks exactly like "nothing has been produced yet" and biases every turn
+  // toward writing something new. listEditors covered for this, but only by
+  // rediscovering the board from scratch each turn with no idea which request
+  // produced which node.
+  // The type argument is explicit because the signature takes
+  // `Omit<UI_MESSAGE, "id">`, and TS cannot infer UI_MESSAGE through Omit — left
+  // implicit it silently widens to the base UIMessage and `part.data` is
+  // `unknown`, which is exactly the SDK drift the typed data parts exist to catch.
+  const modelMessages: ModelMessage[] = convertToModelMessages<AppUIMessage>(messages, {
+    convertDataPart: (part) =>
+      part.type === "data-scriptChip"
+        ? {
+            type: "text",
+            text: `[${
+              part.data.mode === "write" ? "Wrote" : "Revised"
+            } the script "${part.data.title}" in its editor node on the canvas.]`,
+          }
+        : undefined,
+  });
 
   const stream = createUIMessageStream<AppUIMessage>({
     // Default masks errors as "An error occurred." A wrong model id or base URL
@@ -88,6 +112,7 @@ function summarise(spent: Spend[]): UsagePayload {
 type Action =
   | { kind: "write"; title: string }
   | { kind: "edit"; nodeId: string; blockIndex: number; instruction: string }
+  | { kind: "rewrite"; nodeId: string; instruction: string }
   | { kind: "mindmap"; topic: string; id: string }
   | { kind: "chat" };
 
@@ -161,6 +186,12 @@ async function decide(
       blockIndex: chosen.input.blockIndex,
       instruction: chosen.input.instruction,
     };
+  if (chosen?.toolName === "rewriteScript")
+    return {
+      kind: "rewrite",
+      nodeId: chosen.input.nodeId,
+      instruction: chosen.input.instruction,
+    };
   if (chosen?.toolName === "createMindmap")
     return { kind: "mindmap", topic: chosen.input.topic, id: chosen.toolCallId };
   if (chosen) return { kind: "chat" }; // answerInChat
@@ -183,7 +214,7 @@ async function decide(
 OPEN EDITORS (ordinals in the request refer to this numbering):
 ${boardIndex(scripts)}
 
-If the request refers to one of those editors and asks to change, improve, rewrite, shorten, or fix any part of it, the action is editBlock and you must return that editor's exact nodeId. Only use answerInChat when the request is not about producing or changing canvas content.`,
+If the request refers to one of those editors and asks to change, improve, shorten, or fix any part of it, return that editor's exact nodeId. Pick editBlock when one paragraph can be swapped for another and the rest still reads correctly; pick rewriteScript when an item is removed, added, or reordered, or a count changes — anything that leaves the numbering or the intro inconsistent. Changing a script the user already has is never writeScript. Only use answerInChat when the request is not about producing or changing canvas content.`,
     tools: { route: fallbackRouteTool },
     toolChoice: { type: "tool", toolName: "route" },
   });
@@ -206,6 +237,12 @@ If the request refers to one of those editors and asks to change, improve, rewri
       blockIndex: r.blockIndex ?? 1,
       instruction: r.instruction ?? "Improve this paragraph.",
     };
+  if (r?.action === "rewriteScript")
+    return {
+      kind: "rewrite",
+      nodeId: r.nodeId ?? "",
+      instruction: r.instruction ?? "Revise this script.",
+    };
   return { kind: "chat" };
 }
 
@@ -225,7 +262,7 @@ async function act({
   const plainChat = async () => {
     const result = streamText({
       model,
-      system: CHAT_SYSTEM,
+      system: chatSystem(scripts),
       messages: modelMessages,
     });
     writer.merge(result.toUIMessageStream());
@@ -236,7 +273,7 @@ async function act({
   const pipeInto = async (opts: {
     nodeId: string;
     title: string;
-    mode: "write" | "edit";
+    mode: "write" | "edit" | "rewrite";
     blockIndex?: number;
     system: string;
     prompt?: string;
@@ -288,7 +325,7 @@ async function act({
     }
     emit(acc.trim(), true);
     emitChip(true);
-    spent.push({ label: opts.mode === "edit" ? "edit" : "writing", usage: await result.totalUsage });
+    spent.push({ label: opts.mode === "write" ? "writing" : opts.mode, usage: await result.totalUsage });
   };
 
   if (action.kind === "chat") return plainChat();
@@ -315,7 +352,7 @@ async function act({
   const hit = scripts.find((s) => s.nodeId === action.nodeId);
   const script = hit ?? (scripts.length === 1 ? scripts[0] : undefined);
 
-  // An unresolvable edit must NOT fall through to a chat completion.
+  // An unresolvable edit or rewrite must NOT fall through to a chat completion.
   //
   // It used to. With three same-titled scripts on the board, "change the second
   // paragraph of the 2nd script" resolved to nothing, hit plainChat(), and the
@@ -332,6 +369,25 @@ async function act({
             .map((s, i) => `${i + 1}. ${s.title} (${s.blocks.length} paragraphs)`)
             .join("\n")}\n\nTell me the number, e.g. "change paragraph 2 of script 1".`,
     );
+  }
+
+  // Same node, same title, every paragraph replaced. The client distinguishes
+  // this from "write" purely by the node already existing, so nothing new
+  // appears on the canvas.
+  // Deliberately NO `prompt`, so this call gets the conversation instead.
+  //
+  // With only the instruction and the current text, a rewrite cannot know what
+  // the user asked for in earlier turns — so a request they already made
+  // ("remove JavaScript") is invisible to it, and anything that survived the
+  // earlier one-paragraph edit gets faithfully preserved, which reads as the
+  // change being undone. The history is what makes the revision cumulative.
+  if (action.kind === "rewrite") {
+    return pipeInto({
+      nodeId: script.nodeId,
+      title: script.title,
+      mode: "rewrite",
+      system: rewriteSystem(script.blocks.join("\n\n"), action.instruction),
+    });
   }
 
   // blockIndex is 1-based and model-supplied.
