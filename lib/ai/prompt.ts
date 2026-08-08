@@ -1,8 +1,7 @@
 import type { BoardScript } from "@/lib/types";
 
-// The agent's system prompt carries NO canvas state. It describes the job and
-// the tools; the agent calls listEditors when it needs to know what is on the
-// board. That keeps the prompt a fixed size no matter how large the canvas gets.
+// No canvas state in this prompt — the agent calls listEditors when it needs
+// to know what's on the board, so the prompt stays fixed-size regardless.
 export const AGENT_SYSTEM = `You work inside a canvas-based writing app. Most users are here to write scripts (YouTube, TikTok), social posts, and similar long-form content. Each script lives in its own editor node on the canvas, and the user can have many open at once.
 
 Choose one action:
@@ -21,6 +20,9 @@ SWAPPING one thing for another ("remove JavaScript and make it React") is editBl
 
 Asking ABOUT a script is not changing it. "summarise the content", "what does it say", "which languages did you pick", "is this any good?" -> answerInChat. Choose editBlock or rewriteScript ONLY when the user wants the text on the canvas to actually become different.
 
+A NEW TOPIC IS ALWAYS writeScript. If the user asks for a script, post, or draft about something that has no editor open yet, that is writeScript — create it. "No editor is open for that topic" is a reason to WRITE one, never a reason to answer in chat or to ask whether they want one. Never offer to fold a new topic into an unrelated existing script.
+  "Write a 1 minute TikTok script explaining ghosts" with only a Minecraft script open -> writeScript. Ghosts is a new topic; the Minecraft node is irrelevant to it.
+
 Iterating on a script the user already has is NEVER writeScript. writeScript is only for an ADDITIONAL piece of content that stands alongside the existing ones ("now write me a YouTube one about Nintendo"). rewriteScript keeps the same node; writeScript creates a second one.
 
 Only long-form content the user will come back and revise belongs on the canvas. Explanations and answers do not.
@@ -34,14 +36,8 @@ Finding the right editor:
 - Do not keep inspecting. Two listEditors calls are enough: one to find the script, one to read it. Then commit to an action.
 - If the user asks for a change WITHOUT naming an editor, they mean the one marked mostRecent. When they want a different one they say so, by title or by ordinal. Only ask which they meant if they name one that matches nothing on the board.`;
 
-// Compact index of the board — ids, titles, creation order. NO paragraph text,
-// so it stays small regardless of how much has been written.
-//
-// This is the one place canvas state enters a prompt, and only on the recovery
-// path (see the fallback in the chat route). Without it the fallback can decide
-// "editBlock" but cannot name a nodeId, and an unresolvable edit used to fall
-// through to a plain chat completion that regenerated the whole script into the
-// transcript — the exact failure this feature exists to prevent.
+// Compact board index — ids, titles, creation order, no paragraph text. Used
+// on the fallback recovery path so it can name a nodeId, not just an action.
 export function boardIndex(scripts: BoardScript[], limit = 30): string {
   if (scripts.length === 0) return "No script editors are open.";
   const shown = scripts.slice(-limit);
@@ -54,15 +50,11 @@ export function boardIndex(scripts: BoardScript[], limit = 30): string {
   return (skipped > 0 ? [`… ${skipped} older editors omitted`, ...lines] : lines).join("\n");
 }
 
-// Writes a brand new script. No tools, so the entire output of this call is
-// script body and can be piped straight into one node.
 export const WRITE_SYSTEM = `You write scripts and long-form social content.
 
 Output ONLY the script itself — no preamble, no title line, no commentary, no markdown headings, no surrounding quotes.
 Separate paragraphs with a blank line. Keep paragraphs short enough to revise individually.`;
 
-// Rewrites exactly one paragraph, given the rest as context. The entire point of
-// the feature: no whole-document regeneration.
 export function editSystem(fullScript: string, original: string): string {
   return `You revise ONE paragraph inside a larger script.
 
@@ -75,15 +67,8 @@ THE PARAGRAPH TO REWRITE:
 ${original}`;
 }
 
-// Replaces a whole script in place. Same node, all paragraphs replaced.
-//
-// This is NOT a relaxation of the no-whole-document-regeneration rule — it is
-// what makes that rule survivable. Measured before this existed: "remove Java
-// from the top 5" routed to editBlock and, across three runs, substituted
-// JavaScript for Java, duplicated React, and renumbered Swift while leaving Java
-// in place. Every one corrupted the script, because a one-paragraph swap cannot
-// express a structural change. The cost is regenerating the whole body; the
-// alternative was silent corruption or a duplicate node.
+// Replaces a whole script in place, same node — what makes the "never
+// regenerate the whole document" rule survivable for structural changes.
 export function rewriteSystem(fullScript: string, instruction: string): string {
   return `You revise an ENTIRE script in place and return the whole revised script.
 
@@ -105,9 +90,6 @@ THE CURRENT SCRIPT:
 ${fullScript}`;
 }
 
-// Manual selection edit. The user highlighted an arbitrary range — maybe a
-// clause, maybe three sentences spanning a paragraph break — so the reply has to
-// splice back in at exactly that spot and read grammatically.
 export function selectionSystem(fullScript: string, selected: string): string {
   return `You rewrite an EXACT selected fragment inside a larger script.
 
@@ -125,33 +107,29 @@ THE EXACT SELECTED FRAGMENT TO REPLACE:
 ${selected}`;
 }
 
-// Plain chat answer, no canvas involvement.
-//
-// The hard length cap is a containment measure, not a style preference. Routing
-// is probabilistic, so this path will occasionally be reached for a request that
-// should have edited a script — measured, the model then regenerated the entire
-// script into the transcript, which is the one outcome this feature exists to
-// prevent. A reply that cannot exceed ~60 words cannot be a script, whatever the
-// router got wrong.
+// The 60-word cap is containment, not style: if routing sends a script-editing
+// request here by mistake, a reply this short cannot become the script.
 export const CHAT_SYSTEM = `You are a helpful assistant inside a canvas writing app. Scripts and long-form drafts live in editor nodes on the canvas, never in this chat.
 
 Hard rules:
 - NEVER write a script, social post, blog draft, or any long-form content here, even if asked directly.
 - NEVER reproduce or rewrite the text of an existing script here.
 - Keep every reply under 60 words.
-- If the user seems to want a script written or changed but it is not clear which one, say so in one sentence and ask them which editor and which paragraph.
+- NEVER tell the user you cannot write scripts, and never explain that no editor is
+  open for their topic. Writing IS something this app does — it just happens on the
+  canvas, through a different path than this reply. Saying "I can't write scripts
+  here" reads as the product being broken, and it is the one thing you must not say.
+- If they asked for something new to be written and it did not appear, that is a
+  routing miss on our side, not a refusal. Say, in one short line, that you will need
+  them to ask again — never blame a missing editor and never offer to bolt their new
+  topic onto an unrelated existing script.
+- If the user seems to want an EXISTING script changed but it is not clear which one,
+  ask which editor and which paragraph, in one sentence.
 
 Otherwise answer the question concisely in plain text.`;
 
-// The chat path used to be the ONLY one with no canvas context at all, which
-// made it confidently wrong about the board: asked to "summarise the content",
-// it summarised the conversation and then stated that no script had been
-// written — while the script sat on the canvas next to it. That denial then
-// stays in the transcript and is read back by every later turn.
-//
-// The most recent script is included in full because that is what an unqualified
-// "the content" refers to. Safe to show: the 60-word cap above means this call
-// cannot reproduce it even if it tries.
+// The most recent script is included in full — safe to, since the 60-word cap
+// above means this call can't reproduce it even if it tries.
 export function chatSystem(scripts: BoardScript[]): string {
   const recent = scripts[scripts.length - 1];
   return `${CHAT_SYSTEM}

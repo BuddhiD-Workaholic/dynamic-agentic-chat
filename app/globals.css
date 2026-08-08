@@ -42,8 +42,7 @@ body {
   cursor: auto;
   position: relative;
 }
-/* Counts the transcript's renders, not the chat shell's. Sticky so it stays
-   visible while the log scrolls — typing should never move this number. */
+/* Sticky so it stays visible while the log scrolls. */
 .log-badge {
   position: sticky;
   top: 0;
@@ -181,6 +180,44 @@ body {
   color: var(--muted);
   font-weight: 700;
 }
+.node-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+  animation: pulse 1s ease-in-out infinite;
+}
+/* Ambient cue that a node is working, visible without staring at the text. */
+.script-node.is-active {
+  border-top-color: var(--accent);
+  box-shadow:
+    0 1px 2px rgba(16, 24, 40, 0.06),
+    0 0 0 1px rgba(51, 85, 255, 0.25);
+  animation: node-glow 2.2s ease-in-out infinite;
+}
+@keyframes node-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 1px 2px rgba(16, 24, 40, 0.06),
+      0 0 0 1px rgba(51, 85, 255, 0.22);
+  }
+  50% {
+    box-shadow:
+      0 2px 10px rgba(51, 85, 255, 0.16),
+      0 0 0 1px rgba(51, 85, 255, 0.4);
+  }
+}
 .node-title {
   font-weight: 600;
   flex: 1;
@@ -218,10 +255,9 @@ body {
   background: #fff7db;
   border-radius: 4px;
 }
-.stream-tag {
-  font-size: 11px;
+/* Previous text held while the model thinks; dimmed to read as "being replaced". */
+.stream-para.editing.awaiting {
   color: var(--muted);
-  margin-top: 4px;
 }
 .caret {
   display: inline-block;
@@ -246,37 +282,112 @@ body {
   margin: 0 0 8px;
 }
 
-/* selection edit bar */
-.edit-bar {
-  flex: 0 0 auto;
-  border-top: 1px solid var(--line);
-  padding: 8px 12px;
-  background: var(--panel);
-}
-.edit-hint {
+/* In the document flow, not reserved chrome — scrolls away with the script. */
+.ai-hint {
   font-size: 11px;
   color: var(--muted);
+  margin-top: 2px;
+  opacity: 0.8;
 }
-.edit-row {
+
+/* Popover is absolutely positioned inside this relative container, so it pans
+   and zooms with the canvas for free as an ordinary DOM descendant. */
+.node-body {
+  position: relative;
+}
+.ai-popover {
+  position: absolute;
+  z-index: 5;
+  width: 220px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(16, 24, 40, 0.14), 0 1px 2px rgba(16, 24, 40, 0.08);
+  padding: 8px;
+  animation: popover-in 120ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.ai-popover.above {
+  transform: translate(-50%, calc(-100% - 8px));
+}
+.ai-popover.below {
+  transform: translate(-50%, 8px);
+}
+@keyframes popover-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, calc(-100% - 2px)) scale(0.97);
+  }
+}
+.ai-popover.below {
+  animation-name: popover-in-below;
+}
+@keyframes popover-in-below {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 2px) scale(0.97);
+  }
+}
+.ai-popover-selection {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 6px;
+}
+.ai-popover-row {
   display: flex;
   gap: 6px;
-  margin-top: 6px;
 }
-.edit-input {
+.ai-popover-input {
   flex: 1;
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: 7px;
   padding: 6px 8px;
   font: inherit;
   font-size: 12.5px;
 }
-.edit-go {
+.ai-popover-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.ai-popover-go {
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 7px;
   padding: 0 12px;
   font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 56px;
 }
-
-.edit-error {
+.ai-popover-go:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.ai-popover-error {
+  font-size: 11px;
   color: #b42318;
+  margin-top: 6px;
+}
+.spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* Live agent activity: what tool is running, right now. */
@@ -295,11 +406,6 @@ body {
   gap: 7px;
   font-size: 11.5px;
   color: var(--muted);
-}
-.tool-line code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  color: var(--ink);
 }
 .tool-state {
   margin-left: auto;
@@ -350,11 +456,10 @@ body {
   color: #333;
 }
 
-/* Per-paragraph render counter. During an edit only the targeted paragraph's
-   number moves; every other paragraph stays put.
-   Off by default — it is instrumentation, and inline numbers make the script
-   itself hard to read. Toggle with the ¶ button in the chat header. */
-:root:not([data-renders="on"]) .para-badge {
+/* Dev instrumentation, off by default — toggled by the 🛠 button in the header. */
+:root:not([data-renders="on"]) .render-badge,
+:root:not([data-renders="on"]) .para-badge,
+:root:not([data-renders="on"]) .usage {
   display: none;
 }
 .para-badge {
@@ -387,9 +492,34 @@ body {
   background: #ffe08a;
 }
 
+/* The range the popover is acting on — a ProseMirror decoration, not
+   ::selection, since focusing the popover's input drops the browser selection. */
+.prose-mini .ai-range {
+  background: #ffe08a;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px #f0c33c;
+}
+
+/* React Flow's stylesheet sets cursor:grab on every draggable node; `nodrag`
+   stops the drag but not the cursor, so this overrides it back for text. */
+.prose-mini,
+.prose-mini p {
+  cursor: text;
+}
+.ai-hint {
+  cursor: default;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .caret,
-  .tool-line.running .tool-dot {
+  .tool-line.running .tool-dot,
+  .status-dot,
+  .script-node.is-active,
+  .spinner {
+    animation: none;
+  }
+  .ai-popover,
+  .ai-popover.below {
     animation: none;
   }
 }

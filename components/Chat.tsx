@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
 import { useCanvasStore } from "@/lib/store";
@@ -8,11 +8,19 @@ import { routeScriptData, useSettleStreams } from "@/components/useScriptRouter"
 import { RenderBadge } from "@/components/RenderBadge";
 import type { AppUIMessage } from "@/lib/types";
 
-// Live agent activity, in its own component with its own store subscription.
-//
-// Placed here rather than inside ChatLog on purpose: tool events fire several
-// times per turn, and routing them through the transcript would re-render every
-// message. This way a tool event re-renders exactly this strip.
+// Tool names are internal implementation detail — the person watching this
+// strip is asking "what is it doing", not "which function is running".
+const TOOL_LABEL: Record<string, string> = {
+  listEditors: "Looking at your scripts",
+  writeScript: "Writing a new script",
+  editBlock: "Editing a paragraph",
+  rewriteScript: "Rewriting the script",
+  createMindmap: "Building a mindmap",
+  answerInChat: "Thinking",
+};
+
+// Own component so tool events (several per turn) re-render this strip only,
+// not the whole transcript.
 const AgentActivity = memo(function AgentActivity() {
   const activity = useCanvasStore((s) => s.toolActivity);
   if (activity.length === 0) return null;
@@ -21,8 +29,8 @@ const AgentActivity = memo(function AgentActivity() {
       {activity.map((a) => (
         <div key={a.tool} className={`tool-line ${a.state}`}>
           <span className="tool-dot" />
-          <code>{a.tool}</code>
-          <span className="tool-state">{a.state === "running" ? "running…" : "done"}</span>
+          <span>{TOOL_LABEL[a.tool] ?? a.tool}</span>
+          {a.state === "running" && <span className="tool-state">…</span>}
         </div>
       ))}
     </div>
@@ -31,13 +39,8 @@ const AgentActivity = memo(function AgentActivity() {
 
 const nf = new Intl.NumberFormat("en-US");
 
-// The transcript, split out and memoised.
-//
-// `Chat` owns the textarea's value and useChat's status, so it re-renders on
-// every keystroke and every status change. Without this split those re-renders
-// re-ran the whole messages.map() — typing one character re-rendered the entire
-// transcript. Memoised on `messages`, the log now renders only when the
-// conversation actually changes: twice per script turn, for the two chip writes.
+// Split out and memoised on `messages` — `Chat` re-renders on every keystroke,
+// and without this split that re-ran the whole messages.map() each time.
 const ChatLog = memo(function ChatLog({
   messages,
   error,
@@ -45,8 +48,43 @@ const ChatLog = memo(function ChatLog({
   messages: AppUIMessage[];
   error?: Error;
 }) {
+  const logRef = useRef<HTMLDivElement>(null);
+
+  // Stick to the bottom until the user deliberately scrolls away, rather than
+  // re-deciding from the current distance on every message — the agent-activity
+  // strip appearing below the log is a container RESIZE, not a message change,
+  // so a messages-only effect can miss it.
+  const stick = useRef(true);
+
+  const onScroll = () => {
+    const el = logRef.current;
+    if (!el) return;
+    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
+  useEffect(() => {
+    const el = logRef.current;
+    if (!el) return;
+
+    const toBottom = () => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    };
+
+    // Synchronous first, so following doesn't depend on a frame callback —
+    // rAF and ResizeObserver are both suspended in a hidden tab. The rAF pass
+    // then corrects for anything landing later in the same commit.
+    toBottom();
+    const frame = requestAnimationFrame(toBottom);
+    const ro = new ResizeObserver(toBottom); // catches the resize `messages` can't see
+    ro.observe(el);
+    return () => {
+      cancelAnimationFrame(frame);
+      ro.disconnect();
+    };
+  }, [messages]);
+
   return (
-    <div className="chat-log nowheel nodrag">
+    <div className="chat-log nowheel nodrag" ref={logRef} onScroll={onScroll}>
       <RenderBadge label="log" className="render-badge log-badge" />
         {messages.length === 0 && (
           <div className="empty">
@@ -62,10 +100,9 @@ const ChatLog = memo(function ChatLog({
         )}
 
         {messages.map((m) => (
-          <div key={m.id} className={`msg ${m.role}`}>
+          // data-message-id: how a node's edge finds the bubble that asked for it.
+          <div key={m.id} data-message-id={m.id} className={`msg ${m.role}`}>
             {m.parts.map((part, i) => {
-              // Only text renders in the transcript. The script body arrives as
-              // a data part, so it cannot leak in here even by accident.
               if (part.type === "text")
                 return (
                   <span key={i} className="msg-text">
@@ -73,9 +110,6 @@ const ChatLog = memo(function ChatLog({
                   </span>
                 );
 
-              // The chip is a small persistent record. The script body itself
-              // is transient and never reaches `messages`, so it cannot leak
-              // into the transcript even by accident.
               if (part.type === "data-scriptChip")
                 return (
                   <div key={i} className="chip">
@@ -126,25 +160,19 @@ const ChatLog = memo(function ChatLog({
 export function Chat() {
   const [input, setInput] = useState("");
 
-  // Paragraph render counters are instrumentation, so they are off by default —
-  // inline numbers make the script itself hard to read. Driven through a data
-  // attribute and hidden in CSS rather than by unmounting the badges, so the
-  // counts keep accruing while hidden and are correct the moment you toggle
-  // them on mid-stream.
-  const [showParaRenders, setShowParaRenders] = useState(false);
+  // Off by default — debug info for whoever is developing this, not for a
+  // person writing a script. Hidden in CSS, not unmounted, so counts keep
+  // accruing and are already correct the moment this is switched on.
+  const [showDebugInfo, setShowDebugInfo] = useState(false);
   useEffect(() => {
-    document.documentElement.dataset.renders = showParaRenders ? "on" : "off";
-  }, [showParaRenders]);
+    document.documentElement.dataset.renders = showDebugInfo ? "on" : "off";
+  }, [showDebugInfo]);
 
   const { messages, sendMessage, status, error } = useChat<AppUIMessage>({
-    // Script content is transient, so it never lands in `messages`; it arrives
-    // here instead. That is what keeps this component's render count flat while
-    // a script node streams.
-    onData: routeScriptData,
+    onData: routeScriptData, // transient script content arrives here, not via `messages`
     transport: new DefaultChatTransport({
       api: "/api/chat",
-      // A fresh snapshot of the board every turn is what lets the model resolve
-      // "the Minecraft script" to a specific node.
+      // A fresh board snapshot each turn lets the model resolve "the Minecraft script".
       prepareSendMessagesRequest: ({ messages }) => ({
         body: { messages, scripts: useCanvasStore.getState().getBoardScripts() },
       }),
@@ -170,11 +198,12 @@ export function Chat() {
         <span className="muted">scripts stream to their own nodes →</span>
         <button
           className="renders-toggle nodrag"
-          aria-pressed={showParaRenders}
-          onClick={() => setShowParaRenders((v) => !v)}
-          title="Show per-paragraph render counters. During an edit, only the paragraph being changed should move."
+          aria-pressed={showDebugInfo}
+          aria-label="Toggle debug info"
+          onClick={() => setShowDebugInfo((v) => !v)}
+          title="Show debug info: render counters and token cost"
         >
-          ¶
+          🛠
         </button>
         <RenderBadge label="renders" />
       </div>

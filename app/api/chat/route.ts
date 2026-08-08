@@ -4,6 +4,7 @@ import {
   createUIMessageStream,
   createUIMessageStreamResponse,
   generateText,
+  smoothStream,
   stepCountIs,
   streamText,
   type LanguageModelUsage,
@@ -11,7 +12,7 @@ import {
   type UIMessageStreamWriter,
 } from "ai";
 import { model, routerModel } from "@/lib/ai/model";
-import { buildTools, fallbackRouteTool } from "@/lib/ai/tools";
+import { buildTools, fallbackRouteTool, formatScriptTitle } from "@/lib/ai/tools";
 import {
   AGENT_SYSTEM,
   WRITE_SYSTEM,
@@ -29,18 +30,9 @@ import type {
 
 export const maxDuration = 60;
 
-// An agent decides, then a tool-free call writes.
-//
-// Phase 1 is an agent with tools but no prose: it inspects the board through
-// listEditors and commits to one action. Every tool argument is short, so it
-// does not matter that this provider streams tool arguments unevenly.
-//
-// Phase 2 streams the body with NO tools attached. That is the isolation
-// guarantee, and it is structural rather than a parsing trick: the entire
-// output of that call belongs to exactly one node, so there is nothing to
-// extract and nothing that *can* leak into the transcript. Measured against the
-// alternative (body inside the tool argument), that alternative leaked prose
-// into chat and once delivered 1511 characters in a single chunk. See README.
+// An agent decides (tools, no prose), then a tool-free call streams the body.
+// Phase 2 has no tools attached, so its entire output belongs to one node —
+// there is nothing to extract and nothing that can leak into the transcript.
 const MAX_STEPS = 6;
 
 export async function POST(req: Request) {
@@ -49,20 +41,13 @@ export async function POST(req: Request) {
     scripts?: BoardScript[];
   };
 
-  // convertDataPart is what keeps the assistant's past turns from being EMPTY.
-  //
-  // Script bodies are transient by design, so the only thing an assistant turn
-  // carries is the chip — and data parts are dropped unless this is supplied.
-  // Without it the router reads a history of blank assistant replies, which
-  // looks exactly like "nothing has been produced yet" and biases every turn
-  // toward writing something new. listEditors covered for this, but only by
-  // rediscovering the board from scratch each turn with no idea which request
-  // produced which node.
-  // The type argument is explicit because the signature takes
-  // `Omit<UI_MESSAGE, "id">`, and TS cannot infer UI_MESSAGE through Omit — left
-  // implicit it silently widens to the base UIMessage and `part.data` is
-  // `unknown`, which is exactly the SDK drift the typed data parts exist to catch.
-  const modelMessages: ModelMessage[] = convertToModelMessages<AppUIMessage>(messages, {
+  // Two views of the same conversation. The type argument is explicit because
+  // the signature takes `Omit<UI_MESSAGE, "id">`, which TS can't infer through —
+  // left implicit, `part.data` silently widens to `unknown`.
+
+  // ROUTING view: past script turns are converted into "[Wrote the script X…]"
+  // markers, so the router doesn't see blank assistant replies.
+  const routerMessages: ModelMessage[] = convertToModelMessages<AppUIMessage>(messages, {
     convertDataPart: (part) =>
       part.type === "data-scriptChip"
         ? {
@@ -74,18 +59,23 @@ export async function POST(req: Request) {
         : undefined,
   });
 
+  // WRITING view: deliberately withOUT those markers. The writing call is a
+  // tool-free continuation of the conversation, so fed the markers it will
+  // imitate them and emit one AS the script body — reproduced from a real
+  // session as a node whose entire content was `[Wrote the script "X"…]`.
+  const modelMessages: ModelMessage[] = convertToModelMessages<AppUIMessage>(messages);
+
   const stream = createUIMessageStream<AppUIMessage>({
-    // Default masks errors as "An error occurred." A wrong model id or base URL
-    // is the likeliest failure and is otherwise invisible from the UI.
     onError: (error) => (error instanceof Error ? error.message : String(error)),
 
     execute: async ({ writer }) => {
       const spent: Spend[] = [];
-      const action = await decide(writer, modelMessages, scripts, spent);
-      await act({ action, writer, modelMessages, scripts, spent });
+      const action = await decide(writer, routerMessages, scripts, spent);
+      // convertToModelMessages drops the client-assigned id; recovered here so
+      // a new node's edge can anchor to the exact bubble that asked for it.
+      const sourceMessageId = [...messages].reverse().find((m) => m.role === "user")?.id;
+      await act({ action, writer, modelMessages, scripts, spent, sourceMessageId });
 
-      // Written once, at the very end. Route-then-stream costs more than one
-      // model call, and the breakdown makes that visible rather than hidden.
       writer.write({ type: "data-usage", id: "usage", data: summarise(spent) });
     },
   });
@@ -93,7 +83,6 @@ export async function POST(req: Request) {
   return createUIMessageStreamResponse({ stream });
 }
 
-// One model call's cost, labelled so the breakdown means something.
 type Spend = { label: string; usage: LanguageModelUsage | undefined };
 
 function summarise(spent: Spend[]): UsagePayload {
@@ -107,8 +96,6 @@ function summarise(spent: Spend[]): UsagePayload {
   };
 }
 
-// What the agent settled on. One shape, so the primary path and the fallback
-// converge instead of leaving two tool-call unions to switch over.
 type Action =
   | { kind: "write"; title: string }
   | { kind: "edit"; nodeId: string; blockIndex: number; instruction: string }
@@ -122,33 +109,25 @@ async function decide(
   scripts: BoardScript[],
   spent: Spend[],
 ): Promise<Action> {
-  // Built per request because listEditors closes over this board.
   const agent = new Agent({
     model: routerModel,
     system: AGENT_SYSTEM,
     tools: buildTools(scripts),
     stopWhen: stepCountIs(MAX_STEPS),
-    // Paired with the answerInChat tool, so "just reply" is something the agent
-    // names rather than the absence of a call.
-    //
-    // A nudge, NOT a guarantee: measured on MiniMax-M3 this is honoured only
-    // sometimes — the provider returns finish_reason:"stop" with prose and no
-    // call at all. Hence the forced-named fallback below. On providers that do
-    // honour it (OpenAI), this layer alone is enough.
+    // Not a guarantee — some providers return finish_reason:"stop" with prose
+    // and no call despite this. The forced-named fallback below covers that.
     toolChoice: "required",
   });
 
-  // stream() rather than generate(): routing takes several seconds and used to
-  // be dead air. Streaming lets the tool calls be reported as they happen.
+  // stream(), not generate(): routing takes several seconds, so tool calls are
+  // reported live rather than as dead air.
   const routed = agent.stream({ messages });
 
-  // TRANSIENT — live status, not conversation. Goes to onData, never `messages`.
   const note = (tool: string, state: "running" | "done") =>
     writer.write({ type: "data-tool", transient: true, data: { tool, state } });
 
   // Inspection tools resolve with a result; action tools have no `execute`, so
-  // the call itself is where they finish. Tools that DO execute emit both, hence
-  // the dedupe by call id.
+  // the call itself is where they finish — dedupe by call id covers both.
   const settled = new Set<string>();
   for await (const part of routed.fullStream) {
     if (part.type === "tool-input-start") {
@@ -163,10 +142,6 @@ async function decide(
   const toolCalls = await routed.toolCalls;
   spent.push({ label: "routing", usage: await routed.totalUsage });
 
-  // toolCalls aggregates every step, so drop the inspection calls and take the
-  // action it settled on. The dynamic variant (an unparsable call, or a tool the
-  // model invented) types `input` as unknown — discarding it gives real types
-  // and degrades garbage to chat.
   const chosen = toolCalls
     .filter((c) => !c.dynamic && !c.invalid && c.toolName !== "listEditors")
     .pop();
@@ -178,7 +153,7 @@ async function decide(
   );
 
   if (chosen?.toolName === "writeScript")
-    return { kind: "write", title: chosen.input.title };
+    return { kind: "write", title: formatScriptTitle(chosen.input) };
   if (chosen?.toolName === "editBlock")
     return {
       kind: "edit",
@@ -196,14 +171,9 @@ async function decide(
     return { kind: "mindmap", topic: chosen.input.topic, id: chosen.toolCallId };
   if (chosen) return { kind: "chat" }; // answerInChat
 
-  // No call at all: the provider ignored toolChoice and answered in prose. Ask
-  // again with a single FORCED named function, which it honours far more often.
-  //
-  // Deliberately WITHOUT the conversation history. Measured: forcing works 3/3
-  // on a bare request but degrades on a long transcript — a history full of
-  // prose primes yet more prose, which is the very failure being recovered from.
-  // Classification only needs the latest ask, and dropping the rest also makes
-  // this call O(1) in conversation length.
+  // No call at all: ask again with a single forced named function, dropping
+  // history — a transcript full of prose primes more prose, the failure this
+  // recovers from, and classification only needs the latest message anyway.
   const forced = await generateText({
     model: routerModel,
     system: AGENT_SYSTEM,
@@ -223,13 +193,12 @@ If the request refers to one of those editors and asks to change, improve, short
   log(`fallback -> ${r?.action ?? "(still none)"}`);
 
   if (r?.action === "writeScript")
-    return { kind: "write", title: r.title ?? "Untitled" };
-  if (r?.action === "createMindmap")
     return {
-      kind: "mindmap",
-      topic: r.topic ?? "Untitled",
-      id: crypto.randomUUID(),
+      kind: "write",
+      title: formatScriptTitle({ title: r.title ?? "Untitled", duration: r.duration, platform: r.platform }),
     };
+  if (r?.action === "createMindmap")
+    return { kind: "mindmap", topic: r.topic ?? "Untitled", id: crypto.randomUUID() };
   if (r?.action === "editBlock")
     return {
       kind: "edit",
@@ -252,12 +221,14 @@ async function act({
   modelMessages,
   scripts,
   spent,
+  sourceMessageId,
 }: {
   action: Action;
   writer: UIMessageStreamWriter<AppUIMessage>;
   modelMessages: ModelMessage[];
   scripts: BoardScript[];
   spent: Spend[];
+  sourceMessageId?: string;
 }) {
   const plainChat = async () => {
     const result = streamText({
@@ -277,13 +248,14 @@ async function act({
     blockIndex?: number;
     system: string;
     prompt?: string;
+    // "write" only — anchors the edge to the message that created this node.
+    sourceMessageId?: string;
+    sourcePrompt?: string;
   }) => {
     const streamId = crypto.randomUUID();
 
-    // TRANSIENT: delivered to useChat's onData and never added to `messages`.
-    // As a normal data part every token mutated the message list, so the chat
-    // node re-rendered once per token (measured: 358 renders for one paragraph
-    // edit). This is what keeps the chat flat while a node streams.
+    // Transient: delivered to onData, never added to `messages` — keeps the
+    // chat flat while a node streams (measured: otherwise 358 renders/edit).
     const emit = (content: string, done: boolean) =>
       writer.write({
         type: "data-script",
@@ -295,13 +267,14 @@ async function act({
           content,
           mode: opts.mode,
           blockIndex: opts.blockIndex,
+          sourceMessageId: opts.sourceMessageId,
+          sourcePrompt: opts.sourcePrompt,
           done,
         } satisfies ScriptStreamPayload,
       });
 
-    // PERSISTENT, and written exactly twice: the transcript keeps a record that
-    // a script was written, without the body ever entering it. Same id both
-    // times, so the SDK reconciles rather than appending.
+    // Persistent, written exactly twice: a record in the transcript without
+    // the body ever entering it.
     const emitChip = (done: boolean) =>
       writer.write({
         type: "data-scriptChip",
@@ -312,9 +285,13 @@ async function act({
     emitChip(false);
     emit("", false); // node appears before the first token
 
+    // Re-chunks to word boundaries — without it a short edit can arrive in
+    // 2-3 bursts with a multi-second gap, which reads as the text dropping in
+    // whole rather than streaming.
     const result = streamText({
       model,
       system: opts.system,
+      experimental_transform: smoothStream({ chunking: "word" }),
       ...(opts.prompt ? { prompt: opts.prompt } : { messages: modelMessages }),
     });
 
@@ -331,11 +308,7 @@ async function act({
   if (action.kind === "chat") return plainChat();
 
   if (action.kind === "mindmap") {
-    return writer.write({
-      type: "data-mindmap",
-      id: action.id,
-      data: { topic: action.topic },
-    });
+    return writer.write({ type: "data-mindmap", id: action.id, data: { topic: action.topic } });
   }
 
   if (action.kind === "write") {
@@ -344,22 +317,18 @@ async function act({
       title: action.title,
       mode: "write",
       system: WRITE_SYSTEM,
+      sourceMessageId,
+      sourcePrompt: lastUserText(modelMessages),
     });
   }
 
-  // Models can hallucinate a nodeId. Fall back to the only script on the board
-  // when there is exactly one, rather than failing the turn.
+  // Models can hallucinate a nodeId — fall back to the only script on the
+  // board when there is exactly one, rather than failing the turn.
   const hit = scripts.find((s) => s.nodeId === action.nodeId);
   const script = hit ?? (scripts.length === 1 ? scripts[0] : undefined);
 
-  // An unresolvable edit or rewrite must NOT fall through to a chat completion.
-  //
-  // It used to. With three same-titled scripts on the board, "change the second
-  // paragraph of the 2nd script" resolved to nothing, hit plainChat(), and the
-  // model happily regenerated the entire script into the transcript —
-  // reproduced 5/5, and the exact failure this whole feature exists to prevent.
-  // Asking deterministically is always better than guessing which script to
-  // rewrite, and unlike a model call it cannot produce a script at all.
+  // Must NOT fall through to plain chat: an unresolved edit used to land there
+  // and the model would regenerate the whole script into the transcript.
   if (!script || script.blocks.length === 0) {
     return writeText(
       writer,
@@ -371,17 +340,10 @@ async function act({
     );
   }
 
-  // Same node, same title, every paragraph replaced. The client distinguishes
-  // this from "write" purely by the node already existing, so nothing new
-  // appears on the canvas.
-  // Deliberately NO `prompt`, so this call gets the conversation instead.
-  //
-  // With only the instruction and the current text, a rewrite cannot know what
-  // the user asked for in earlier turns — so a request they already made
-  // ("remove JavaScript") is invisible to it, and anything that survived the
-  // earlier one-paragraph edit gets faithfully preserved, which reads as the
-  // change being undone. The history is what makes the revision cumulative.
   if (action.kind === "rewrite") {
+    // No `prompt` — this call gets the full conversation instead, so a change
+    // requested in an earlier turn ("remove JavaScript") is still visible and
+    // doesn't get silently restored by a rewrite that only sees the current text.
     return pipeInto({
       nodeId: script.nodeId,
       title: script.title,
@@ -390,8 +352,7 @@ async function act({
     });
   }
 
-  // blockIndex is 1-based and model-supplied.
-  const index = Number.isFinite(action.blockIndex)
+  const index = Number.isFinite(action.blockIndex) // 1-based, model-supplied
     ? Math.min(Math.max(action.blockIndex - 1, 0), script.blocks.length - 1)
     : 0;
 
@@ -415,9 +376,7 @@ function lastUserText(messages: ModelMessage[]): string {
     .join(" ");
 }
 
-// A fixed message we author, streamed as ordinary chat text. Used where a model
-// call would be dangerous — it cannot regenerate a script, because there is no
-// model involved.
+// A model-free reply — used where a model call could regenerate a script.
 function writeText(writer: UIMessageStreamWriter<AppUIMessage>, text: string) {
   const id = crypto.randomUUID();
   writer.write({ type: "text-start", id });
@@ -425,8 +384,6 @@ function writeText(writer: UIMessageStreamWriter<AppUIMessage>, text: string) {
   writer.write({ type: "text-end", id });
 }
 
-// Routing decisions are invisible from the UI and the first thing you want to
-// see when gating misbehaves.
 function log(msg: string) {
   if (process.env.NODE_ENV !== "production") console.log(`[agent] ${msg}`);
 }

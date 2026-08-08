@@ -173,6 +173,44 @@ The cost is honest: an edit now takes 3 agent steps (`listEditors` → `listEdit
 → `editBlock`) instead of reading a pre-injected snapshot. That is slower per edit and
 constant in board size, which is the right trade at 1000 boards and the wrong one at 3.
 
+### You can watch the agent think, and see what it cost
+
+Routing takes several seconds — the agent is calling `listEditors`, reading a script,
+then committing — and that used to be dead air. The chat now shows tool calls live, and
+the token cost of the turn when it finishes:
+
+```
+listEditors  done
+editBlock    running…
+
+5,710 tokens (in 4,932 · out 778 · routing 4,848, edit 862)
+```
+
+Tool activity is a **transient** data part (status, not conversation — it never enters
+the transcript), rendered by its own memoised component with its own store
+subscription. Measured across all six tool events of one edit: the chat shell stayed at
+`renders · 24` and the transcript at `log · 12`. Only the activity strip re-rendered.
+
+The token breakdown is worth leaving visible, because it makes the honest cost of this
+design impossible to hide:
+
+| Turn | routing | writing | total |
+| --- | --- | --- | --- |
+| New script | 1,461 | 963 | 2,424 |
+| **Edit one paragraph** | **4,848** | 862 | **5,710** |
+| Plain Q&A | 1,467 | 401 | 1,868 |
+
+**Routing is ~85% of the cost of an edit.** Inspect-then-act means `listEditors` returns
+a script's full text into the conversation, and the agent loops over it. Writing the
+actual replacement paragraph is the cheap part. If this went to production the first
+optimisation would be there — cache the board read per turn, or let `listEditors` return
+a paragraph range rather than the whole script — not in the streaming layer everyone
+looks at first.
+
+> Getting real numbers needed `includeUsage: true` on the provider. Without it,
+> OpenAI-compatible endpoints omit the usage chunk from **streaming** responses, so
+> every streamed call silently reports zero while non-streamed ones look fine.
+
 ---
 
 ## Where each mechanic lives

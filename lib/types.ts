@@ -1,62 +1,47 @@
 import type { UIMessage } from "ai";
 
-// A script is an ordered list of paragraphs, addressed BY INDEX.
-//
-// Index rather than uuid is a deliberate simplification. The model is shown the
-// canvas snapshot and answers about it in the same turn, so the index it reads
-// is the index we apply — stable by construction. Using uuids here cost three
-// separate bugs in the previous design: partial-JSON streaming delivered
-// truncated uuid prefixes, local editing re-keyed ids by position anyway, and
-// carrying ids through the rich-text editor needed a custom extension.
+// Paragraphs are addressed BY INDEX, not uuid — the model is shown the canvas
+// snapshot and answers about it in the same turn, so the index it reads is
+// stable by construction.
 export type ScriptNodeData = {
   kind: "script";
   title: string;
   blocks: string[];
-  // Bumped only when the committed text is replaced wholesale (stream finished).
-  // The editor is keyed on this so it remounts with fresh content. Local typing
-  // must NOT bump it, or the editor would remount under the user's cursor.
+  // Bumped only when text is replaced wholesale; the editor is keyed on this
+  // to remount with fresh content. Local typing must NOT bump it.
   rev: number;
 };
 
-// The chat itself is a node on the canvas, with edges to the scripts it made.
 export type ChatNodeData = { kind: "chat" };
 
 // Compact snapshot of the board, sent to the model each turn so it can target
 // an existing script ("the Minecraft script") instead of regenerating it.
 export type BoardScript = { nodeId: string; title: string; blocks: string[] };
 
-// The live script stream. Sent as a TRANSIENT data part, so it is delivered to
-// useChat's onData callback and never added to `messages`.
-//
-// That distinction is load-bearing. As a normal data part, every token mutates
-// the message list, so the chat node re-renders once per token — measured at
-// 358 renders for a single paragraph edit. Transient parts leave `messages`
-// untouched, so the chat re-renders only when the chip below is written.
-//
-// `content` is ACCUMULATED rather than a delta. Deltas would halve the bytes,
-// but a single dropped chunk would silently corrupt the script, whereas an
-// accumulated payload self-heals on the next write.
+// Sent as a TRANSIENT data part — delivered to onData, never added to
+// `messages`, so the chat doesn't re-render per token. `content` is
+// accumulated rather than delta'd, so a dropped chunk self-heals on the next.
 export type ScriptStreamPayload = {
   nodeId: string;
-  // Unique per stream. An edit re-targets an existing nodeId, so nodeId alone
-  // cannot tell "still finalizing the last stream" from "a new edit started" —
-  // without this, the second edit to a node would be silently ignored.
+  // Unique per stream, so a later edit to the same node isn't mistaken for a
+  // repeat of an already-finalized one.
   streamId: string;
   title: string;
   content: string;
-  // "write" creates a new node. "edit" replaces ONE paragraph of an existing
-  // one. "rewrite" replaces ALL paragraphs of an existing one, in place —
-  // needed because an edit cannot delete, insert, or renumber paragraphs, so
-  // "remove Java from the top 5" is not expressible as an edit.
+  // "write" creates a new node. "edit" replaces one paragraph. "rewrite"
+  // replaces all paragraphs in place — for changes an edit can't express
+  // (deleting/inserting/renumbering items).
   mode: "write" | "edit" | "rewrite";
   blockIndex?: number; // edit mode: which paragraph is being replaced
+  // "write" only: which chat bubble caused this node to exist, so the edge can
+  // anchor to that message. sourcePrompt is just its text, for a tooltip.
+  sourceMessageId?: string;
+  sourcePrompt?: string;
   done: boolean;
 };
 
-// The small, PERSISTENT record of a script action that stays in the chat
-// transcript. Written exactly twice per stream (start and done), which is what
-// keeps the chat node's render count flat while a script streams — see the note
-// on ScriptStreamPayload above.
+// PERSISTENT, written exactly twice per stream (start, done) — a record in
+// the transcript that never carries the body itself.
 export type ScriptChipPayload = {
   title: string;
   mode: "write" | "edit" | "rewrite";
@@ -65,17 +50,13 @@ export type ScriptChipPayload = {
 
 export type MindmapPayload = { topic: string };
 
-// What the agent is doing right now. TRANSIENT and ephemeral: routing takes
-// several seconds and used to be dead air, so this exists to fill it. It is
-// deliberately not kept in the transcript — it is status, not conversation.
+// TRANSIENT — live routing status, not kept in the transcript.
 export type ToolActivityPayload = {
   tool: string;
   state: "running" | "done";
 };
 
-// Token cost of a whole turn, written once at the end. PERSISTENT, because the
-// interesting thing about route-then-stream is that it costs more than one
-// model call, and hiding that would be dishonest.
+// PERSISTENT, written once at the end of a turn.
 export type UsagePayload = {
   totalTokens: number;
   inputTokens: number;
@@ -84,8 +65,6 @@ export type UsagePayload = {
   calls: { label: string; totalTokens: number }[];
 };
 
-// Typing the data parts is what makes `npm run typecheck` able to catch SDK
-// drift. Untyped, a mistyped part name silently no-ops at runtime forever.
 export type AppDataTypes = {
   script: ScriptStreamPayload;
   scriptChip: ScriptChipPayload;

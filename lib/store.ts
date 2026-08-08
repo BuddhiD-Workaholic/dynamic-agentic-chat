@@ -9,10 +9,14 @@ import type {
 
 export const CHAT_NODE_ID = "chat";
 
-// A streaming buffer lives OUTSIDE the React Flow `nodes` array on purpose.
-// Per-token updates touch only `buffers[nodeId]`, so the only component that
-// re-renders is the one node selecting that slice. The `nodes` array changes
-// exactly twice per script: once on create, once on final commit.
+// Board layout, in flow coordinates. Chat sits left-of-centre with its own
+// margin; SCRIPT.x clears the chat's right edge by 180px so new nodes open
+// in clear columns beside it, never tucked underneath.
+const CHAT = { x: 380, y: 140, w: 400, h: 560 };
+const SCRIPT = { x: 960, y: 40, w: 360, h: 440, colGap: 420, rowGap: 470, rows: 2 };
+
+// Lives outside the `nodes` array on purpose: per-token updates touch only
+// `buffers[nodeId]`, so only the one node selecting that slice re-renders.
 type Buffer = {
   streamId: string;
   title: string;
@@ -30,11 +34,9 @@ type CanvasState = {
   onNodesChange: (changes: NodeChange[]) => void;
   getBoardScripts: () => BoardScript[];
 
-  // The single entry point for streamed script content, write and edit alike.
   applyScript: (p: ScriptStreamPayload) => void;
 
-  // Live "the agent is calling listEditors…" status for the current turn.
-  // Ephemeral: cleared when the next turn starts.
+  // Live tool-call status for the current turn, cleared when the next starts.
   toolActivity: { tool: string; state: "running" | "done" }[];
   noteToolActivity: (tool: string, state: "running" | "done") => void;
   clearToolActivity: () => void;
@@ -54,7 +56,6 @@ export const toBlocks = (text: string): string[] =>
     .map((t) => t.trim())
     .filter(Boolean);
 
-// Commit a buffer's content into the node's committed data.
 function commit(nodes: Node[], nodeId: string, buf: Buffer): Node[] {
   return nodes.map((n) => {
     if (n.id !== nodeId) return n;
@@ -98,32 +99,32 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     set((s) => {
       const existing = s.buffers[p.nodeId];
 
-      // The router effect re-runs on every token, replaying every part it sees.
-      // Once a given stream is finalized, ignore its repeats — otherwise the
-      // final payload would re-commit forever, bumping `rev` and remounting the
-      // editor under the user. Keyed on streamId so a LATER edit still applies.
+      // Ignore repeats of an already-finalized stream — otherwise the final
+      // payload re-commits forever, bumping `rev` and remounting the editor.
       if (existing?.streamId === p.streamId && !existing.streaming) return s;
 
       let nodes = s.nodes;
       let edges = s.edges;
 
-      // First sight of a new script: add the node and wire it back to the chat.
-      // Guarded on "write" specifically — a rewrite targets a node that already
-      // exists, so it must never spawn a second one. That is the whole point.
+      // First sight of a new script. Guarded on "write" — a rewrite targets a
+      // node that already exists and must never spawn a second one.
       if (p.mode === "write" && !nodes.some((n) => n.id === p.nodeId)) {
         const count = nodes.filter(
           (n) => (n.data as { kind?: string }).kind === "script",
         ).length;
+        const col = Math.floor(count / SCRIPT.rows);
+        const row = count % SCRIPT.rows;
         nodes = [
           ...nodes,
           {
             id: p.nodeId,
             type: "script",
-            position: { x: 700, y: 40 + count * 470 },
-            // Explicit size so NodeResizer has something to drag, and so the
-            // node's own layout can flex to fill it.
-            width: 360,
-            height: 440,
+            position: {
+              x: SCRIPT.x + col * SCRIPT.colGap,
+              y: SCRIPT.y + row * SCRIPT.rowGap,
+            },
+            width: SCRIPT.w,
+            height: SCRIPT.h,
             data: {
               kind: "script",
               title: p.title || "Untitled",
@@ -139,6 +140,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
             source: CHAT_NODE_ID,
             target: p.nodeId,
             animated: true,
+            // "ask": anchors to the actual chat bubble that created this node
+            // (components/edges/AskEdge.tsx), not a fixed point on the panel.
+            type: "ask",
+            data: { messageId: p.sourceMessageId, sourcePrompt: p.sourcePrompt },
           },
         ];
       }
@@ -206,18 +211,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 }));
 
 // The board starts with just the chat node; everything else is created by use.
-//
-// Render isolation is demonstrated with real content rather than filler: ask for
-// a second script, then edit the first. While one script node streams, the other
-// script nodes must not re-render at all.
 export function seedBoard() {
   if (useCanvasStore.getState().nodes.length > 0) return;
   const chat: Node = {
     id: CHAT_NODE_ID,
     type: "chat",
-    position: { x: 40, y: 40 },
-    width: 400,
-    height: 560,
+    position: { x: CHAT.x, y: CHAT.y },
+    width: CHAT.w,
+    height: CHAT.h,
     data: { kind: "chat" } satisfies ChatNodeData,
     draggable: true,
   };

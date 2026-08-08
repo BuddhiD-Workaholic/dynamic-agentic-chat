@@ -12,11 +12,10 @@ import {
 import "@xyflow/react/dist/style.css";
 import { seedBoard, useCanvasStore } from "@/lib/store";
 import { ScriptNode } from "@/components/nodes/ScriptNode";
+import { AskEdge } from "@/components/edges/AskEdge";
 import { Chat } from "@/components/Chat";
 
-// Chat lives ON the canvas, wired by edges to the scripts it produced — the
-// "since it's connected" model from the brief. Kept here rather than in its own
-// file to keep the file count down.
+// Chat lives ON the canvas, wired by edges to the scripts it produced.
 const ChatNode = memo(function ChatNode() {
   return (
     <div className="node chat-node">
@@ -27,10 +26,10 @@ const ChatNode = memo(function ChatNode() {
   );
 });
 
-// Module scope, deliberately. An inline object would be a new reference on
-// every render and React Flow remounts every node when nodeTypes changes —
-// the classic footgun that would wreck the isolation this POC is measuring.
+// Module scope: an inline object here would be a new reference every render,
+// and React Flow remounts every node when nodeTypes changes.
 const nodeTypes = { script: ScriptNode, chat: ChatNode };
+const edgeTypes = { ask: AskEdge };
 
 export function Canvas() {
   const nodes = useCanvasStore((s) => s.nodes);
@@ -44,6 +43,7 @@ export function Canvas() {
       nodes={nodes}
       edges={edges}
       nodeTypes={nodeTypes}
+      edgeTypes={edgeTypes}
       onNodesChange={onNodesChange}
       minZoom={0.2}
       maxZoom={1.5}
